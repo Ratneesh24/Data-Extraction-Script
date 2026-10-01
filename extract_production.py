@@ -152,6 +152,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # added on top of the mill figures. Verified every run against breakdown_reference_area.
     "breakdown_areas": r"^\s*(?:HNT|TUBE|FULL\s*HARD|LG\b.*|OEM)(?:\s+(?:ROLLING|FINISH|R/R|SKP))?\s*$",
     "breakdown_reference_area": r"^\s*BOTH\s*MILLS?\s*$",
+    # User-confirmed measures for columns whose headers carry no Input/Output keyword:
+    # [regex on the header path "A > B > C", measure]. Applied only when headers give no measure.
+    "measure_overrides": [
+        [r"^\s*TUBE\s*>\s*(?:SKP|R/R)\s*$", "Output"],
+        [r"^\s*SPM\s*0?2\s*>\s*RE-?\s*SKINPASS\s*$", "Output"],
+    ],
 }
 
 CFG: dict[str, Any] = {}
@@ -164,7 +170,7 @@ def load_config(path: Path | None) -> None:
     if path:
         user = json.loads(Path(path).read_text(encoding="utf-8"))
         for k, v in user.items():
-            if k in ("measures", "summary", "units") and isinstance(v, list):
+            if k in ("measures", "summary", "units", "measure_overrides") and isinstance(v, list):
                 cfg[k] = v + cfg[k]  # user entries take priority
             else:
                 cfg[k] = v
@@ -174,6 +180,7 @@ def load_config(path: Path | None) -> None:
     RX["measures"] = [(n, re.compile(p, re.I)) for n, p in cfg["measures"]]
     RX["summary"] = [(n, re.compile(p, re.I)) for n, p in cfg["summary"]]
     RX["units"] = [(n, re.compile(p, re.I)) for n, p in cfg["units"]]
+    RX["measure_overrides"] = [(re.compile(p, re.I), m) for p, m in cfg["measure_overrides"]]
     for k in ("cumulative", "date_header", "serial_header", "shift_header", "remarks_header",
               "weekday_header", "row_area_header", "row_process_header", "title_markers",
               "note_markers", "placeholders", "known_areas", "noise_words", "weekday_names",
@@ -1480,6 +1487,11 @@ def build_record(S, view, cell, vc, vr, block_id, ccomb: Combined, hp, row_comb:
             if comb.measure:
                 measure, msrc = comb.measure, src
                 break
+    if measure is None and hp:
+        path = " > ".join(t for t, _, _ in hp)
+        hit = next((m for rx, m in RX["measure_overrides"] if rx.search(path)), None)
+        if hit:
+            measure, msrc = hit, "config (confirmed mapping)"
     if measure is None and title_comb.measure:
         measure, msrc = title_comb.measure, "sheet title"
         review.append(f"measure '{measure}' inferred from sheet title (no measure in headers)")

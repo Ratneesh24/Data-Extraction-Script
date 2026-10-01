@@ -155,3 +155,11 @@ def test_plant_short_month_total_row_and_repeated_headers(out):
     assert not feb["Row"].isin([39, 40, 41]).any()        # repeated header rows are headers
     assert "Non-existent day row" in set(feb["ReasonCategory"])
     assert (feb["NearestLabel"] == "ROLLING").any()       # calc block kept with its label
+
+
+def test_measure_override_applies_only_without_header_measure():
+    ep.load_config(None)
+    path_rx = ep.RX["measure_overrides"]
+    assert any(rx.search("TUBE > SKP") for rx, _ in path_rx)
+    assert any(rx.search("SPM02 > RE-SKINPASS") for rx, _ in path_rx)
+    assert not any(rx.search("TUBE > CRM04 > O/P") for rx, _ in path_rx)

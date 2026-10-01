@@ -74,6 +74,8 @@ Behaviour verified on the 42 monthly files (Jan-2023 .. Jun-2026):
   TOTAL row exactly.
 * The calculation blocks below the table (PRODUCTION OF CRM04/CRM06, utilisation, yield helpers) are
   not daily data; they are listed in `unmapped_data.xlsx` with `NearestLabel`, `Unit` and `BlockTitle`.
+* `TUBE > SKP`, `TUBE > R/R` and `SPM02 > RE-SKINPASS` have no Input/Output header; they are mapped to
+  **Output** (confirmed by the plant) via `measure_overrides`.
 * Edit `breakdown_areas` / `breakdown_reference_area` in the config if segments are renamed or added.
 
 ## Customising keywords
