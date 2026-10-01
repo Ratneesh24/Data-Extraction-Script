@@ -1,0 +1,7 @@
+output/
+__pycache__/
+*.pyc
+.pytest_cache/
+# plant data is never committed
+input/*.zip
+input/**/*.xlsx
