@@ -59,6 +59,23 @@ decide) are **not guessed** – they are flagged.
   in unmapped – open/save such files in Excel and re-run.
 * `.xls`/`.xlsb` files and corrupt workbooks are listed as not processed / failed, never skipped silently.
 
+## CRM "PRODUCTION" template (FY23-27 files)
+Behaviour verified on the 42 monthly files (Jan-2023 .. Jun-2026):
+* Main table: dates in column A, 3-level header (mill/segment > process > Input/Output), TOTAL row,
+  header rows repeated below the table. Helper day-number columns (X, AE, AL, AS, AX) are treated as
+  attributes of the date, not as data.
+* `CRM04`, `CRM06`, `SPM02` are mills/lines (`Dimension = Mill/Line`). `HNT`, `TUBE`, `FULL HARD`,
+  `LG BALA/ROCKMAN/TIDC`, `OEM` are a **product breakdown of the same mill output**
+  (`Dimension = Product segment`, never counted as production). The breakdown is reconciled daily
+  against `BOTH MILL ... o/p of both mill`.
+* `CRM.. > TOTAL`, `BOTH MILL TOTAL ...` and columns proven to be calculated (e.g. `TUBE ROLLING O/P`
+  = TUBE + FULL HARD outputs, `OEM ROLLING O/P`, `OEM FINISH O/P`, unlabelled copy/difference columns)
+  are kept but marked `IsSummary`, so `CountsAsProduction` daily CRM04+CRM06 output equals each file's
+  TOTAL row exactly.
+* The calculation blocks below the table (PRODUCTION OF CRM04/CRM06, utilisation, yield helpers) are
+  not daily data; they are listed in `unmapped_data.xlsx` with `NearestLabel`, `Unit` and `BlockTitle`.
+* Edit `breakdown_areas` / `breakdown_reference_area` in the config if segments are renamed or added.
+
 ## Customising keywords
 Mill/area names, measure synonyms (e.g. `prodn`, `o/p`, `ABP`), summary words and units live in
 `DEFAULT_CONFIG` at the top of the script. Extend them without editing code:

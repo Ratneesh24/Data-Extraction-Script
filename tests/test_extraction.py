@@ -109,3 +109,49 @@ def test_duplicate_file_flagged(out):
     w = read(out, "production_master.csv")
     copy = w[w.SourcePath.str.contains("copy/")]
     assert copy["DuplicateFlag"].fillna("").str.contains("DUPLICATE-EXACT").all()
+
+
+# ---- plant template (mirrors the real CRM 'PRODUCTION' sheet with synthetic numbers) ----------
+
+def plant(out, month):
+    long = read(out, "production_master_long.csv")
+    return long[long.SourceFile == f"{month}-PRODUCTION NARROW-2025.xlsx"]
+
+
+def test_plant_helper_day_column_is_attribute(out):
+    p = plant(out, "FEB")
+    assert set(p["Layout"]) == {"vertical"}
+    assert not (p["SourceColumn"] == "L").any()          # helper day numbers are not production values
+    assert p[p.CountsAsProduction]["Date"].nunique() == 28
+
+
+def test_plant_mill_total_matches_total_row(out):
+    for month in ("FEB", "MARCH"):
+        p = plant(out, month)
+        daily = p[p.CountsAsProduction & (p.Measure == "Output")]["Value"].sum()
+        total = p[(p.Area == "BOTH MILL") & (p.RecordType == "Total") & (p.Measure == "Output")
+                  & p.Process.isna()]["Value"].iloc[0]
+        assert abs(daily - total) < 0.01
+
+
+def test_plant_segments_and_derived_not_counted(out):
+    p = plant(out, "MARCH")
+    seg = p[p.Dimension == "Product segment"]
+    assert len(seg) and not seg["CountsAsProduction"].any()
+    sumcol = p[p.SourceColumn == "S"]
+    assert (sumcol[sumcol.RecordType != "Total"]["RecordType"] == "Derived (calculated column)").all()
+    copy = p[p.SourceColumn == "U"]
+    assert (copy[copy.RecordType != "Total"]["RecordType"] == "Derived (calculated column)").all()
+    rec = read(out, "extraction_report.xlsx", "Reconciliation")
+    issue = rec[rec.SourceFile.str.endswith("MARCH-PRODUCTION NARROW-2025.xlsx")
+                & rec.Check.str.startswith("Calculated column")]
+    assert list(issue["Cell"]) == ["S36"]                 # last day missing in the sum column
+
+
+def test_plant_short_month_total_row_and_repeated_headers(out):
+    u = read(out, "unmapped_data.xlsx", "Unmapped")
+    feb = u[u.SourceFile.str.endswith("FEB-PRODUCTION NARROW-2025.xlsx")]
+    assert not (feb["Row"] == 37).any()                   # TOTAL row after 3 blank day rows is extracted
+    assert not feb["Row"].isin([39, 40, 41]).any()        # repeated header rows are headers
+    assert "Non-existent day row" in set(feb["ReasonCategory"])
+    assert (feb["NearestLabel"] == "ROLLING").any()       # calc block kept with its label

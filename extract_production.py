@@ -52,6 +52,7 @@ import argparse
 import calendar
 import datetime as dt
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -67,6 +68,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import openpyxl
 import pandas as pd
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -145,6 +147,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "known_areas": r"\b(?:CRM\s*-?\s*\d+|PLTCM|CPL|PL\s*-?\s*\d+|BAF|HPM|SPM|CRS|CTL|ECL|ETL|HDGL|CGL|CAL|ARP|RCL|SKIN\s*PASS|TEMPER\s*MILL|PICKLING(?:\s*LINE)?|SLITTING(?:\s*LINE)?|SLITTER|REWINDING|RECOILING|PACKING|PACKAGING|FINISHING|ANNEALING|COLD\s*MILL|TANDEM\s*MILL)\b",
     "noise_words": r"\b(?:qty|quantity|wt|weight|of|the|for|data|details|value|values|figures?|in|daily|ftd|for\s+the\s+day|today|on\s*date|day)\b",
     "weekday_names": r"^\s*(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)(?:day|nesday|sday|urday|rsday)?\.?\s*$",
+    # Areas that are a product/customer BREAKDOWN of the mill output (not additional production).
+    # Their records get Dimension="Product segment" and CountsAsProduction=False so they are never
+    # added on top of the mill figures. Verified every run against breakdown_reference_area.
+    "breakdown_areas": r"^\s*(?:HNT|TUBE|FULL\s*HARD|LG\b.*|OEM)(?:\s+(?:ROLLING|FINISH|R/R|SKP))?\s*$",
+    "breakdown_reference_area": r"^\s*BOTH\s*MILLS?\s*$",
 }
 
 CFG: dict[str, Any] = {}
@@ -169,7 +176,8 @@ def load_config(path: Path | None) -> None:
     RX["units"] = [(n, re.compile(p, re.I)) for n, p in cfg["units"]]
     for k in ("cumulative", "date_header", "serial_header", "shift_header", "remarks_header",
               "weekday_header", "row_area_header", "row_process_header", "title_markers",
-              "note_markers", "placeholders", "known_areas", "noise_words", "weekday_names"):
+              "note_markers", "placeholders", "known_areas", "noise_words", "weekday_names",
+              "breakdown_areas", "breakdown_reference_area"):
         RX[k] = re.compile(cfg[k], re.I)
     analyse_label.cache_clear()
 
@@ -461,7 +469,8 @@ class SheetCtx:
         self.errors.append({"SourceFile": self.fe.display, "Sheet": self.sheet_name,
                             "Category": category, "Location": location, "Detail": detail})
 
-    def unmap(self, cell: Cell, reason: str, category: str, context: str = "") -> None:
+    def unmap(self, cell: Cell, reason: str, category: str, context: str = "", label: str = "",
+              unit: str = "", block_title: str = "") -> None:
         if cell.disposition is not None:
             return
         cell.disposition = "unmapped"
@@ -471,7 +480,7 @@ class SheetCtx:
             "Row": cell.r, "Column": get_column_letter(cell.c), "Cell": cell.ref,
             "Value": cell.raw if not isinstance(cell.raw, (dt.date, dt.time, dt.timedelta)) else str(cell.raw),
             "ValueType": cell.kind, "Formula": cell.formula or "", "ReasonCategory": category,
-            "Reason": reason, "Context": context,
+            "Reason": reason, "Context": context, "NearestLabel": label, "Unit": unit, "BlockTitle": block_title,
             "HiddenRow": cell.r in self.hidden_rows, "HiddenColumn": cell.c in self.hidden_cols,
         })
 
@@ -716,6 +725,18 @@ def find_date_axes(view: View) -> list[Axis]:
 
 
 def choose_anchors(view: View, cands: list[Axis]) -> list[Axis]:
+    # day-number helper columns that run alongside a real date column (same rows) are
+    # attributes of that date column, not separate tables
+    real = [a for a in cands if a.n_real > 0]
+    keep = []
+    for cand in cands:
+        if cand.n_real == 0 and cand.has_days:
+            host = next((a for a in real if len(set(a.rows) & set(cand.rows)) >= 0.8 * len(a.rows)), None)
+            if host is not None:
+                host.attr_cols.append(cand.vc)
+                continue
+        keep.append(cand)
+    cands = keep
     anchors: list[Axis] = []
     for cand in sorted(cands, key=lambda a: a.vc):
         if anchors:
@@ -868,6 +889,7 @@ def process_sheet(S: SheetCtx) -> None:
             S.note("Multiple tables", f"{len(anchors)} date axes found ({', '.join(view.colref(a.vc) for a in anchors)})")
     for ti, (anchor, cols) in enumerate(tables, 1):
         process_table(S, view, anchor, cols, ti)
+    reconcile_breakdown(S)
     finalise_leftovers(S)
 
 
@@ -915,6 +937,9 @@ def process_table(S: SheetCtx, view: View, anchor: Axis | None, cols: list[int],
         r = g[0] - 1
         while r > prev_last and len(hdrs) < 10:
             st = rs(r)
+            row_cells = [c for vc, c in view.by_row.get(r, {}).items() if vc in colset and c.kind != "BLANK"]
+            if row_cells and all(c.disposition == "title" for c in row_cells):
+                break
             if st.empty:
                 if hdrs:
                     break
@@ -936,7 +961,13 @@ def process_table(S: SheetCtx, view: View, anchor: Axis | None, cols: list[int],
         prev_last = g[-1]
 
     # ---- post zones (summary rows after the data) -------------------------
+    def is_repeat_header(r: int, hdr_texts: set) -> bool:
+        texts = [c for vc, c in view.by_row.get(r, {}).items() if vc in colset and c.kind == "TEXT"]
+        return len(texts) >= 2 and sum(norm_key(c.text) in hdr_texts for c in texts) >= 0.6 * len(texts)
+
     for i, b in enumerate(blocks):
+        hdr_texts = {norm_key(c.text) for h in b["hdrs"] for vc, c in view.by_row.get(h, {}).items()
+                     if vc in colset and c.kind == "TEXT"}
         if i + 1 < len(blocks):
             nb = blocks[i + 1]
             limit = min(nb["hdrs"] + nb["pre"] + [nb["key"][0]])
@@ -947,8 +978,10 @@ def process_table(S: SheetCtx, view: View, anchor: Axis | None, cols: list[int],
             st = rs(r)
             if st.empty:
                 blanks += 1
-                if blanks >= 3:
+                if blanks >= 6:   # short months leave up to 3 empty day rows before the TOTAL row
                     break
+            elif hdr_texts and is_repeat_header(r, hdr_texts):
+                break
             elif st.header_like and not st.summary_label:
                 break
             elif st.single_text and not st.merged_multi and not st.summary_label:
@@ -962,6 +995,15 @@ def process_table(S: SheetCtx, view: View, anchor: Axis | None, cols: list[int],
         keyset = set(b["key"])
         intra = [r for r in range(b["key"][0], b["key"][-1] + 1) if r not in keyset and not rs(r).empty]
         b["post"], b["intra"] = post, intra
+        # header rows repeated below the table (common in printed reports)
+        rep_rows, r = [], (post[-1] if post else b["key"][-1]) + 1
+        while r < limit and r <= (post[-1] if post else b["key"][-1]) + 8 and hdr_texts:
+            if not rs(r).empty:
+                if not is_repeat_header(r, hdr_texts):
+                    break
+                rep_rows.append(r)
+            r += 1
+        b["repeat_hdrs"] = rep_rows
 
     prev_hdrs: list[int] = []
     prev_block_last = 0
@@ -986,7 +1028,8 @@ def header_paths(view: View, hdrs: list[int], cols: list[int], avc: int | None) 
             if cell is not None and cell.kind != "BLANK":
                 txt = label_of(cell)
                 is_anchor_hdr = vc == avc or (cell.kind == "TEXT" and RX["date_header"].match(txt))
-                last = None if is_anchor_hdr else (txt, cell)
+                # a merged header states its own extent explicitly -> never extend it
+                last = None if is_anchor_hdr or cell.span else (txt, cell)
                 out[vc].append((txt, cell, False))
             else:
                 lower = any((x := view.filled(h2, vc)) is not None and x.kind != "BLANK" for h2 in hdrs[i + 1:])
@@ -1121,6 +1164,14 @@ def process_block(S: SheetCtx, view: View, anchor: Axis | None, cols: list[int],
     hdrs = b["hdrs"]
     hp_all = header_paths(view, hdrs, cols, avc)
 
+    for h in b.get("repeat_hdrs", []):
+        for vc in cols:
+            cell = view.get(h, vc)
+            if cell is not None and cell.disposition is None and cell.kind == "TEXT":
+                cell.disposition, cell.detail = "header", f"{block_id} (repeated header row)"
+    if b.get("repeat_hdrs"):
+        S.note("Repeated header rows", f"{len(b['repeat_hdrs'])} header row(s) repeated below the table "
+               "recognised as headers", block_id)
     # dispositions for header cells
     if not inherited:
         for h in hdrs:
@@ -1198,6 +1249,7 @@ def process_block(S: SheetCtx, view: View, anchor: Axis | None, cols: list[int],
                 prev = k[1]
 
     unlabelled_rows: list[int] = []
+    row_attrs: dict[int, dict] = {}
     block_vals: dict[int, dict[int, float]] = defaultdict(dict)   # vc -> vr -> value (dated rows)
     summary_cells: list[tuple] = []
     recs_this_block: list[dict] = []
@@ -1271,6 +1323,7 @@ def process_block(S: SheetCtx, view: View, anchor: Axis | None, cols: list[int],
                         label_texts.append(c.text)
                         c.disposition, c.detail = "label", block_id
 
+        row_attrs[vr] = attrs
         row_comb = combine_labels([t for t in label_texts if not RX["date_header"].match(t)])
         row_label = " | ".join(label_texts)
         row_type, is_summary = None, False
@@ -1357,13 +1410,21 @@ def process_block(S: SheetCtx, view: View, anchor: Axis | None, cols: list[int],
                 summary_cells.append((vc, vr, rec))
         else:
             prev_dates = [r for r in dated_rows if r < vr]
+            reason = ("Numeric value on a row with no date and no label (e.g. shift/continuation row where the "
+                      "date is not repeated, or an unlabelled total that does not reconcile)")
+            category = "Row without date/label"
+            helper = [v for v in row_attrs.get(vr, {}).values() if re.fullmatch(r"\d{1,2}", str(v))]
+            if helper and S.period and int(helper[0]) > calendar.monthrange(*S.period)[1]:
+                n = int(helper[0])
+                reason = (f"Row for day {n}, which does not exist in {S.period[1]:02d}/{S.period[0]} (date cell empty, "
+                          f"helper day column = {n}); values: {', '.join(fmt_num(c.num) for _, c in cells)}")
+                category = "Non-existent day row"
             for vc, c in cells:
-                S.unmap(c, "Numeric value on a row with no date and no label (e.g. shift/continuation row "
-                           "where the date is not repeated, or an unlabelled total that does not reconcile)",
-                        "Row without date/label",
+                S.unmap(c, reason, category,
                         f"block {block_id}; header '{' > '.join(t for t, _, _ in hp_all.get(vc, []))}'; "
                         f"previous dated row (view) {prev_dates[-1] if prev_dates else '-'}")
 
+    detect_derived(S, view, block_id, recs_this_block, hp_all)
     S.records.extend(recs_this_block)
     reconcile_block(S, view, block_id, roles, hp_all, block_vals, summary_cells, recs_this_block)
 
@@ -1463,6 +1524,9 @@ def build_record(S, view, cell, vc, vr, block_id, ccomb: Combined, hp, row_comb:
         review.append("no mill/area identified")
     area = hierarchy[0] if hierarchy else ""
     process = " | ".join(hierarchy[1:])
+    if not hierarchy and not hp:
+        process = f"(unlabelled column {view.colref(vc)})"
+    dimension = "Product segment" if area and RX["breakdown_areas"].match(area) else "Mill/Line"
 
     # --- record type ----------------------------------------------------
     is_summary = bool(row_is_summary)
@@ -1470,7 +1534,8 @@ def build_record(S, view, cell, vc, vr, block_id, ccomb: Combined, hp, row_comb:
     if col_summary and not row_is_summary:
         rtype = f"{col_summary} (across columns)" if is_key else f"{row_type} / {col_summary} column"
         is_summary = True
-    counts = (not is_summary) and (not cumulative) and rtype in ("Daily", "Monthly", "Period")
+    counts = (not is_summary) and (not cumulative) and rtype in ("Daily", "Monthly", "Period") \
+        and dimension == "Mill/Line"
 
     # --- value -----------------------------------------------------------
     value = float(cell.num)
@@ -1517,7 +1582,7 @@ def build_record(S, view, cell, vc, vr, block_id, ccomb: Combined, hp, row_comb:
         Date=date, Day=day, Month=month, Year=year,
         MonthName=calendar.month_abbr[month] if month else "",
         PeriodSource=period_src, Granularity=granularity if is_key else ("Period" if rtype else ""),
-        Area=area, Process=process, AreaSource=area_src or "", Measure=measure, MeasureName=measure_name,
+        Area=area, Process=process, Dimension=dimension, AreaSource=area_src or "", Measure=measure, MeasureName=measure_name,
         MeasureSource=msrc or "", Basis="Cumulative" if cumulative else "Point",
         Value=value, RawValue=cell.raw if not isinstance(cell.raw, (dt.time, dt.timedelta)) else str(cell.raw),
         Unit=unit or "", Shift=shift or "", RecordType=rtype, IsSummary=is_summary,
@@ -1534,6 +1599,153 @@ def build_record(S, view, cell, vc, vr, block_id, ccomb: Combined, hp, row_comb:
         _vrow=vr, _vcol=vc, _file=S.fe.idx,
     )
     return rec
+
+
+def detect_derived(S, view, block_id, recs, hp_all) -> None:
+    """Find data columns that are arithmetic copies of other columns on every dated row:
+    X = Y + Z (any column), X = Y or X = Y - Z (only unlabelled/unspecified columns).
+    Such columns are marked IsSummary / not CountsAsProduction, so they are never double counted."""
+    dated = [r for r in recs if r["RecordType"] in ("Daily", "Monthly") or "across columns" in r["RecordType"]]
+    if len(dated) < 3:
+        return
+    rows = sorted({r["_vrow"] for r in dated})
+    cols = sorted({r["_vcol"] for r in dated})
+    if len(rows) < 3 or len(cols) < 3:
+        return
+    ri = {v: i for i, v in enumerate(rows)}
+    ci = {v: i for i, v in enumerate(cols)}
+    M = np.zeros((len(rows), len(cols)))
+    for r in dated:
+        M[ri[r["_vrow"]], ci[r["_vcol"]]] = r["Value"]
+    summary_cols = {r["_vcol"] for r in dated if r["IsSummary"]}
+    dim = {r["_vcol"]: r["Dimension"] for r in dated}
+    unlabelled = {r["_vcol"] for r in dated if r["Measure"] == "Unspecified" or not r["HeaderPath"]}
+    nz = (np.abs(M) > 1e-9).sum(axis=0)
+    k = len(cols)
+    D_ = M[:, :, None] - M[:, None, :]
+    eye = np.eye(k, dtype=bool)
+    active = nz > 0
+
+    def hname(i):
+        c = cols[i]
+        return f"{view.colref(c)} '{' > '.join(t for t, _, _ in hp_all.get(c, [])) or '(no header)'}'"
+
+    derived: dict[int, str] = {}
+    exceptions: dict[int, list] = {}
+    e_max = max(1, int(0.1 * len(rows)))   # tolerated exception rows (e.g. formula not copied to day 31)
+    # largest columns first: a total is never smaller than its parts, so totals get marked before they
+    # could be mistaken for components of a smaller column
+    for x in sorted(range(k), key=lambda i: -float(np.abs(M[:, i]).sum())):
+        vc = cols[x]
+        if vc in summary_cols or nz[x] < 3:
+            continue
+        t = M[:, x]
+        tol = 0.005 + 1e-6 * np.abs(t)
+        why = None
+        same_dim = np.array([dim[c] == dim[vc] or cols[i] in unlabelled for i, c in enumerate(cols)])
+        if vc in unlabelled:
+            # copy of a column further left (the left one is treated as the original)
+            eq = [y for y in range(x) if nz[y] >= 3 and np.all(np.abs(M[:, y] - t) <= tol)]
+            if eq:
+                why = f"equals column {hname(eq[0])}"
+        if why is None and nz[x] >= 5:
+            # X = sum of 2..5 other columns. Only columns that never exceed X and are zero
+            # whenever X is zero can be summands; search their subsets, smallest first.
+            xpos = t > tol
+            cand = [y for y in range(k) if y != x and active[y] and same_dim[y] and cols[y] not in derived
+                    and int(np.sum((M[:, y] > t + tol) | ((np.abs(M[:, y]) > tol) & ~xpos))) <= e_max]
+            if 2 <= len(cand) <= 16:
+                found, best_bad = None, None
+                for size in range(2, min(5, len(cand)) + 1):
+                    for combo in itertools.combinations(cand, size):
+                        bad = np.abs(M[:, list(combo)].sum(axis=1) - t) > tol
+                        nbad = int(bad.sum())
+                        good_nz = int((~bad & xpos).sum())
+                        # every component must actually contribute on matching rows
+                        contrib = all(int(((np.abs(M[:, y]) > tol) & ~bad).sum()) >= 2 for y in combo)
+                        if nbad <= e_max and good_nz >= 5 and contrib and (best_bad is None or nbad < best_bad):
+                            found, best_bad, bad_rows = combo, nbad, bad
+                            if nbad == 0:
+                                break
+                    if found and best_bad == 0:
+                        break
+                if found:
+                    why = "= " + " + ".join(hname(y) for y in found)
+                    if best_bad:
+                        comp = M[:, list(found)].sum(axis=1)
+                        exceptions[vc] = [(rows[i], t[i], comp[i]) for i in np.flatnonzero(bad_rows)]
+        if why is None and vc in unlabelled:
+            ok = np.all(np.abs(D_ - t[:, None, None]) <= tol[:, None, None], axis=0)
+            ok &= ~eye & active[:, None] & active[None, :]
+            ok[x, :] = ok[:, x] = False
+            hits = np.argwhere(ok)
+            if len(hits):
+                y, z = hits[0]
+                why = f"= {hname(y)} - {hname(z)}"
+        if why:
+            derived[vc] = why
+    for vc, why in derived.items():
+        exc = exceptions.get(vc, [])
+        S.note("Derived column", f"Column {view.colref(vc)} {why} on "
+               + (f"all dated rows except {len(exc)}" if exc else "every dated row")
+               + " -> marked as derived (not counted as production)", block_id)
+        exc_rows = {vr: (val, comp) for vr, val, comp in exc}
+        date_of = {r["_vrow"]: r["Date"] for r in dated}
+        for vr, val, comp in exc:
+            orow, ocol = view.orig(vr, vc)
+            S.recon.append({"SourceFile": S.fe.display, "Sheet": S.sheet_name, "Block": block_id,
+                            "Check": f"Calculated column vs its components ({why})",
+                            "Cell": f"{get_column_letter(ocol)}{orow}",
+                            "HeaderPath": " > ".join(t for t, _, _ in hp_all.get(vc, [])), "Area": "",
+                            "MeasureName": "", "Expected": comp, "Reported": val, "Difference": val - comp,
+                            "Status": "MISMATCH", "ValuesUsed": None, "Date": date_of.get(vr)})
+            S.note("DATA ISSUE: calculated column", f"{get_column_letter(ocol)}{orow} = {fmt_num(round(val, 3))} "
+                   f"(blank counts as 0) but its components sum to {fmt_num(round(comp, 3))} - formula not "
+                   "extended to this row or manually overridden", block_id)
+        for r in recs:
+            if r["_vcol"] != vc:
+                continue
+            if r["RecordType"] in ("Daily", "Monthly"):
+                r["RecordType"] = "Derived (calculated column)"
+            r["IsSummary"] = True
+            r["CountsAsProduction"] = False
+            r["ReviewFlag"] = True
+            extra = f"calculated column: {why}"
+            if r["_vrow"] in exc_rows:
+                val, comp = exc_rows[r["_vrow"]]
+                extra += (f"; DATA ISSUE: value {fmt_num(round(val, 3))} but its components sum to "
+                          f"{fmt_num(round(comp, 3))} (formula not extended / manual override?)")
+            r["ReviewReason"] = "; ".join(x for x in (r["ReviewReason"], extra) if x)
+
+
+def reconcile_breakdown(S: SheetCtx) -> None:
+    """Product-segment outputs must add up to the reference (both-mill) output each day."""
+    seg = defaultdict(float)
+    ref = {}
+    for r in S.records:
+        if not isinstance(r["Date"], dt.date) or r["Measure"] != "Output":
+            continue
+        if r["Dimension"] == "Product segment" and r["RecordType"] == "Daily":
+            seg[r["Date"]] += r["Value"]
+        elif RX["breakdown_reference_area"].match(r["Area"] or "") and not r["Process"] \
+                and not r["RecordType"].startswith("Derived"):
+            ref.setdefault(r["Date"], r)
+    if not seg or not ref:
+        return
+    for d in sorted(set(seg) | set(ref)):
+        rr = ref.get(d)
+        exp = rr["Value"] if rr else None
+        got = round(seg.get(d, 0.0), 6)
+        if exp is None:
+            st, diff = "NO REFERENCE", None
+        else:
+            diff = got - exp
+            st = "MATCH" if abs(diff) <= 0.02 else "MISMATCH"
+        S.recon.append({"SourceFile": S.fe.display, "Sheet": S.sheet_name, "Block": "",
+                        "Check": "Sum of product-segment Output vs both-mill Output (same day)",
+                        "Cell": rr["SourceCell"] if rr else "", "HeaderPath": rr["HeaderPath"] if rr else "",
+                        "Area": "Product segments", "MeasureName": "Output", "Expected": exp, "Reported": got,
+                        "Difference": diff, "Status": st, "ValuesUsed": None, "Date": d})
 
 
 def reconcile_block(S, view, block_id, roles, hp_all, block_vals, summary_cells, recs) -> None:
@@ -1583,8 +1795,11 @@ def reconcile_block(S, view, block_id, roles, hp_all, block_vals, summary_cells,
         for rec in rlist:
             if "across columns" not in rec["RecordType"] and "column" not in rec["RecordType"]:
                 continue
+            same_area = not rec["Area"].startswith("ALL")
             sib = [x["Value"] for x in rlist if x is not rec and x["MeasureName"] == rec["MeasureName"]
-                   and "column" not in x["RecordType"]]
+                   and "column" not in x["RecordType"] and not x["RecordType"].startswith("Derived")
+                   and x["Dimension"] == rec["Dimension"]
+                   and (not same_area or norm_key(x["Area"]) == norm_key(rec["Area"]))]
             if len(sib) < 2:
                 continue
             st, diff = status(sum(sib), rec["Value"])
@@ -1616,16 +1831,45 @@ def finalise_leftovers(S: SheetCtx) -> None:
     for c in S.cells.values():
         rows[c.r][c.c] = c
 
+    unit_rx = re.compile(r"^\s*(?:mt|mts|t|tons?|tonnes?|hrs?|hours?|%|kg|kgs|nos|kwh|mpm|tph)\.?\s*$", re.I)
+
     def context(cell: Cell) -> str:
         left = [x for cc, x in sorted(rows[cell.r].items()) if cc < cell.c and x.kind == "TEXT"]
         above = [S.cells[(r, cell.c)] for r in range(cell.r - 1, max(0, cell.r - 30), -1)
                  if (r, cell.c) in S.cells and S.cells[(r, cell.c)].kind == "TEXT"]
         parts = []
         if left:
-            parts.append(f"label left: '{left[-1].text}'")
+            parts.append(f"text left: '{left[-1].text}'")
         if above:
             parts.append(f"text above: '{above[0].text}'")
         return "; ".join(parts)
+
+    def structured(cell: Cell) -> dict:
+        """Nearest label (left, no number in between), unit (right) and block title."""
+        label = unit = title = ""
+        for cc in range(cell.c - 1, 0, -1):
+            x = rows[cell.r].get(cc)
+            if x is None or x.kind == "BLANK":
+                continue
+            if x.kind == "TEXT" and not unit_rx.match(x.text):
+                label = x.text
+                break
+            if x.kind != "TEXT":
+                break
+        nxt = rows[cell.r].get(cell.c + 1)
+        if nxt is not None and nxt.kind == "TEXT" and unit_rx.match(nxt.text):
+            unit = nxt.text
+        r = cell.r
+        group = []
+        while r >= 1 and rows.get(r):
+            group.append(r)
+            r -= 1
+        for gr in reversed(group):  # top of the contiguous group first
+            first = rows[gr][min(rows[gr])]
+            if first.kind == "TEXT" and gr != cell.r:
+                title = first.text
+                break
+        return {"label": label, "unit": unit, "block_title": title}
 
     for cell in sorted(S.cells.values(), key=lambda c: (c.r, c.c)):
         if cell.disposition is not None:
@@ -1639,8 +1883,8 @@ def finalise_leftovers(S: SheetCtx) -> None:
             cat = "Note / free text" if is_note_like(cell.text) else "Text outside tables"
             S.unmap(cell, "Text not used as title, header or label", cat, context(cell))
         elif cell.kind in NUMERIC_KINDS:
-            S.unmap(cell, "Numeric value outside any detected data table/block", "Numeric outside table",
-                    context(cell))
+            S.unmap(cell, "Numeric value outside any detected daily data table (e.g. summary/calculation block)",
+                    "Numeric outside table", context(cell), **structured(cell))
         elif cell.kind == "DATE":
             S.unmap(cell, "Date value outside any detected date axis", "Date outside table", context(cell))
         elif cell.kind == "ERROR":
@@ -1761,6 +2005,8 @@ BASE_MEASURE_ORDER = ["Input", "Output", "Target"]
 def mark_duplicates(records: list[dict]) -> list[dict]:
     groups = defaultdict(list)
     for rec in records:
+        if rec["RecordType"].startswith("Derived"):  # calculated copies are not independent data
+            continue
         if isinstance(rec["Date"], dt.date):
             when = rec["Date"].isoformat()
         else:
@@ -1819,7 +2065,7 @@ def build_wide(records: list[dict]) -> pd.DataFrame:
         row["_vals"] = vals
         row.update(OrderedDict(
             Units="; ".join(f"{k}={v}" for k, v in units.items()),
-            Shift=first["Shift"], RecordType=first["RecordType"],
+            Dimension=first["Dimension"], Shift=first["Shift"], RecordType=first["RecordType"],
             IsSummary=any(r["IsSummary"] for r in recs),
             CountsAsProduction=any(r["CountsAsProduction"] for r in recs),
             Granularity=first["Granularity"], PeriodSource=first["PeriodSource"],
@@ -1861,7 +2107,7 @@ def build_wide(records: list[dict]) -> pd.DataFrame:
 # Run
 # --------------------------------------------------------------------------
 LONG_COLS = ["RecordID", "Date", "Day", "Month", "Year", "MonthName", "PeriodSource", "Granularity", "Area",
-             "Process", "AreaSource", "Measure", "MeasureName", "MeasureSource", "Basis", "Value", "RawValue",
+             "Process", "Dimension", "AreaSource", "Measure", "MeasureName", "MeasureSource", "Basis", "Value", "RawValue",
              "Unit", "Shift", "RecordType", "IsSummary", "CountsAsProduction", "Section", "SheetTitle",
              "HeaderPath", "RowLabel", "Remarks", "RowAttributes", "SourceFile", "SourcePath", "ZipFile",
              "SourceSheet", "SourceRow", "SourceColumn", "SourceCell", "Formula", "HiddenRow", "HiddenColumn",
@@ -2038,8 +2284,8 @@ def run(input_path: Path, out_dir: Path, inspect_only: bool = False) -> int:
     long_df = pd.DataFrame([{k: r.get(k) for k in LONG_COLS} for r in records], columns=LONG_COLS)
     wide_df = build_wide(records) if records else pd.DataFrame()
     unm_df = pd.DataFrame(unmapped, columns=["SourceFile", "ZipFile", "Sheet", "Row", "Column", "Cell", "Value",
-                                             "ValueType", "Formula", "ReasonCategory", "Reason", "Context",
-                                             "HiddenRow", "HiddenColumn"])
+                                             "ValueType", "Formula", "ReasonCategory", "Reason", "NearestLabel",
+                                             "Unit", "BlockTitle", "Context", "HiddenRow", "HiddenColumn"])
     review_df = long_df[long_df["ReviewFlag"] == True] if not long_df.empty else long_df  # noqa: E712
 
     # sample records: first 5 daily records of each layout group
