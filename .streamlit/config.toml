@@ -1,0 +1,6 @@
+[server]
+# monthly ZIPs are ~10-20 MB; allow larger multi-year uploads
+maxUploadSize = 500
+
+[browser]
+gatherUsageStats = false

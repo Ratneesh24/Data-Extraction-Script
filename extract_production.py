@@ -1546,8 +1546,9 @@ def build_record(S, view, cell, vc, vr, block_id, ccomb: Combined, hp, row_comb:
     if col_summary and not row_is_summary:
         rtype = f"{col_summary} (across columns)" if is_key else f"{row_type} / {col_summary} column"
         is_summary = True
+    # a value counts as production only if it is a base value of an identified mill/line
     counts = (not is_summary) and (not cumulative) and rtype in ("Daily", "Monthly", "Period") \
-        and dimension == "Mill/Line"
+        and dimension == "Mill/Line" and bool(area)
 
     # --- value -----------------------------------------------------------
     value = float(cell.num)
@@ -1644,6 +1645,18 @@ def detect_derived(S, view, block_id, recs, hp_all) -> None:
 
     derived: dict[int, str] = {}
     exceptions: dict[int, list] = {}
+
+    # 1) direct evidence: the cells hold formulas combining other cells of the same row/column
+    by_col = defaultdict(list)
+    for r in dated:
+        by_col[r["_vcol"]].append(r)
+    for vc, rl in by_col.items():
+        if vc in summary_cols:
+            continue
+        calc = [r for r in rl if is_calc_formula(r["Formula"], r["SourceRow"], r["SourceColumn"])]
+        if len(calc) >= 3 and len(calc) >= 0.8 * len(rl):
+            derived[vc] = f"formula {calc[0]['Formula']} (in {len(calc)}/{len(rl)} dated cells)"
+
     e_max = max(1, int(0.1 * len(rows)))   # tolerated exception rows (e.g. formula not copied to day 31)
     # largest columns first: a total is never smaller than its parts, so totals get marked before they
     # could be mistaken for components of a smaller column
@@ -1728,6 +1741,22 @@ def detect_derived(S, view, block_id, recs, hp_all) -> None:
                 extra += (f"; DATA ISSUE: value {fmt_num(round(val, 3))} but its components sum to "
                           f"{fmt_num(round(comp, 3))} (formula not extended / manual override?)")
             r["ReviewReason"] = "; ".join(x for x in (r["ReviewReason"], extra) if x)
+
+
+CELL_REF_RE = re.compile(r"(?<![A-Za-z_!])\$?([A-Z]{1,3})\$?(\d+)(?![\d(])")
+
+
+def is_calc_formula(formula: str, row: int, col_letter: str) -> bool:
+    """True for formulas that combine >= 2 cells of the cell's own row (or own column), e.g.
+    =B6+D6+F6, =SUM(B6:H6), =BJ6-S6. Single references (=C6) and cross-sheet links are not counted."""
+    if not formula or not str(formula).startswith("=") or "!" in str(formula):
+        return False
+    refs = CELL_REF_RE.findall(str(formula).upper())
+    if len(refs) < 2:
+        return False
+    same_row = all(int(rw) == row for _, rw in refs)
+    same_col = all(c == col_letter for c, _ in refs)
+    return same_row or same_col
 
 
 def reconcile_breakdown(S: SheetCtx) -> None:
@@ -2375,6 +2404,9 @@ def run(input_path: Path, out_dir: Path, inspect_only: bool = False) -> int:
         ("Sample_Records", sample_df),
     ])
     write_excel(out_dir / "inspection_report.xlsx", inspection)
+    (out_dir / "run_summary.json").write_text(
+        json.dumps({k: v if isinstance(v, (int, float, bool)) else str(v) for k, v in summary.items()}, indent=2),
+        encoding="utf-8")
     print_inspection(excel, others, contexts, layout_rows, special, sample_df)
     if inspect_only:
         log.info("Inspection only - wrote %s", out_dir / "inspection_report.xlsx")
