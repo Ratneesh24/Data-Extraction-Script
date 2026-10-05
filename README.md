@@ -17,6 +17,37 @@ python extract_production.py --input path/to/file.zip --output path/to/out
 New month? Drop the new ZIP into `input/` and run the same command. All ZIPs in `input/`
 (including nested ZIPs and sub-folders) are processed.
 
+## Web app (Streamlit)
+
+`streamlit_app.py` puts the same extractor behind a browser page: upload the ZIP, press
+**Run extraction**, review the validation summary, monthly mill output, unmapped cells and
+reconciliation, then download every output file (or all of them as one ZIP).
+
+Run it on your own PC:
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py          # opens http://localhost:8501
+```
+
+Host it on **Streamlit Community Cloud** (free):
+
+1. Go to https://share.streamlit.io and sign in with the GitHub account that owns this repo.
+2. **Create app → Deploy a public app from GitHub** (the repo itself can stay private).
+3. Repository `Ratneesh24/Data-Extraction-Script`, branch `main`, main file `streamlit_app.py`.
+4. Under **Advanced settings** choose Python **3.11** (or newer), then **Deploy**.
+5. After it starts: **Settings → Sharing → Who can view this app → Only specific people**, and invite
+   the colleagues who should use it. Plant data should not be on a publicly viewable app.
+
+Notes for hosting
+* Uploaded files are processed in a temporary folder that is deleted after each run; nothing is
+  stored by the app. They are, however, uploaded to the hosting provider's servers, so check this
+  is allowed for production data. Running locally (`streamlit run ...`) keeps everything on your PC.
+* A full FY23-27 ZIP (42 files) takes about 1-2 minutes on Community Cloud. The upload limit is
+  set to 500 MB in `.streamlit/config.toml`.
+* Any other host that can run `streamlit run streamlit_app.py` works the same way (company server,
+  Azure/AWS VM, Docker).
+
 ## What it produces (`output/`)
 
 | File | Content |

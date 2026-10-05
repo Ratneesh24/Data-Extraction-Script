@@ -163,3 +163,31 @@ def test_measure_override_applies_only_without_header_measure():
     assert any(rx.search("TUBE > SKP") for rx, _ in path_rx)
     assert any(rx.search("SPM02 > RE-SKINPASS") for rx, _ in path_rx)
     assert not any(rx.search("TUBE > CRM04 > O/P") for rx, _ in path_rx)
+
+
+def test_calc_formula_detection():
+    assert ep.is_calc_formula("=BD6+BB6+AZ6", 6, "BJ")
+    assert ep.is_calc_formula("=BJ6-S6", 6, "BL")
+    assert ep.is_calc_formula("=SUM(B6:H6)", 6, "I")
+    assert not ep.is_calc_formula("=C6", 6, "AI")            # single copy is not a calculation
+    assert not ep.is_calc_formula("=E5+D6", 6, "E")          # running total spans rows
+    assert not ep.is_calc_formula("=Sheet2!A6+B6", 6, "C")   # cross-sheet link
+    assert not ep.is_calc_formula("", 6, "C")
+
+
+def test_streamlit_helpers(out):
+    import streamlit_app as app
+    long = read(out, "production_master_long.csv")
+    table = app.monthly_mill_output(long)
+    assert not table.empty and len(table.columns) <= len(app.SERIES_COLORS)
+    assert "(no area)" not in table.columns
+    blob = app.zip_outputs({"a.csv": b"x", "b.txt": b"y"})
+    import zipfile, io
+    assert sorted(zipfile.ZipFile(io.BytesIO(blob)).namelist()) == ["a.csv", "b.txt"]
+
+
+def test_streamlit_app_renders():
+    from streamlit.testing.v1 import AppTest
+    at = AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=30).run()
+    assert not at.exception
+    assert at.title[0].value == "Production Data Extraction"
